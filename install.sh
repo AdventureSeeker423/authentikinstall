@@ -31,6 +31,29 @@ need_root() {
   fi
 }
 
+# Preflight: do NOT hard-block on LXC. Only log warnings.
+preflight_environment() {
+  local virt
+  virt="$(systemd-detect-virt 2>/dev/null || true)"
+  log "Virtualization detected: ${virt:-unknown}"
+
+  if [[ "$virt" == "lxc" ]]; then
+    log "Running inside LXC. Docker may work if nesting + host permissions allow it."
+  fi
+
+  if [[ -e /proc/sys/net/ipv4/ip_unprivileged_port_start ]]; then
+    if ! cat /proc/sys/net/ipv4/ip_unprivileged_port_start >/dev/null 2>&1; then
+      log "WARNING: Cannot read /proc/sys/net/ipv4/ip_unprivileged_port_start (permission denied)."
+    else
+      local v
+      v="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || true)"
+      log "Sysctl readable: net.ipv4.ip_unprivileged_port_start=${v}"
+    fi
+  else
+    log "NOTE: /proc/sys/net/ipv4/ip_unprivileged_port_start not present."
+  fi
+}
+
 rand_b64() {
   # URL-safe-ish base64 (no / + =), good for secrets/tokens
   local n="${1:-48}"
@@ -76,6 +99,59 @@ install_deps() {
   else
     log "Docker Compose already available."
   fi
+}
+
+# Capability-based check: if Docker can't start *any* container, stop early with a useful message.
+docker_runtime_test_or_explain() {
+  if [[ "${FORCE_DOCKER:-0}" == "1" ]]; then
+    log "FORCE_DOCKER=1 set; skipping docker runtime self-test."
+    return 0
+  fi
+
+  log "Running Docker runtime self-test (hello-world)..."
+  local out rc
+  set +e
+  out="$(docker run --rm hello-world 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    log "Docker runtime self-test OK."
+    return 0
+  fi
+
+  log "Docker runtime self-test FAILED. Output:"
+  echo "$out" | tee -a "$LOG_FILE" >&2
+
+  # Signature match for the failure you hit
+  if echo "$out" | grep -q "ip_unprivileged_port_start" && echo "$out" | grep -qiE "reopen fd|permission denied"; then
+    cat >&2 <<'MSG'
+Detected the nested-LXC/AppArmor sysctl reopen failure:
+  open sysctl net.ipv4.ip_unprivileged_port_start ... reopen fd ... permission denied
+
+This is caused by host-side restrictions (LXC/AppArmor/seccomp/proc-sys filtering). Inside the container
+we cannot change those host rules.
+
+What you can do:
+  - Ensure the LXC has Nesting enabled (and sometimes keyctl).
+  - Ensure the Proxmox/LXC/AppArmor packages on the HOST are up to date.
+  - If you know Docker works here and want to force the install attempt:
+      FORCE_DOCKER=1 ./install.sh
+
+This installer will stop now because containers cannot start.
+MSG
+    exit 3
+  fi
+
+  cat >&2 <<'MSG'
+Docker is installed, but this environment cannot start containers (runc/container init failure).
+This is not authentik-specific.
+
+Next checks:
+  - docker info
+  - journalctl -u docker --no-pager | tail -200
+MSG
+  exit 4
 }
 
 ############################################
@@ -131,7 +207,7 @@ setup_compose() {
   POSTGRES_PASSWORD="$(rand_pw 32)"
   AUTHENTIK_SECRET_KEY="$(rand_b64 64)"
 
-  # Bootstrap admin (akadmin) password & API token (documented bootstrap env vars). :contentReference[oaicite:2]{index=2}
+  # Bootstrap admin (akadmin) password & API token
   BOOTSTRAP_PASSWORD="$(rand_pw 20)"
   BOOTSTRAP_TOKEN="$(rand_b64 48)"
   BOOTSTRAP_EMAIL="${BOOTSTRAP_EMAIL:-root@example.com}"
@@ -235,25 +311,6 @@ services:
         condition: service_started
 EOF
 
-  preflight_environment() {
-  local virt
-  virt="$(systemd-detect-virt || true)"
-
-  if [[ "$virt" == "lxc" ]]; then
-    log "Detected LXC environment."
-    cat >&2 <<'MSG'
-This installer uses Docker containers. Docker inside an *unprivileged* LXC often cannot start containers
-because the host blocks access to kernel sysctls (/proc/sys/*) and other required features.
-
-To run this installer reliably, use:
-  - a VM, bare metal, or
-  - a *privileged* LXC with nesting enabled (host-side setting).
-
-There is no safe way for an install script to bypass these host restrictions automatically.
-MSG
-    exit 2
-  fi
-}
   log "Starting authentik stack with docker compose..."
   docker compose up -d
 
@@ -799,7 +856,9 @@ PY
 
 main() {
   need_root
+  preflight_environment
   install_deps
+  docker_runtime_test_or_explain
   get_inputs
   setup_compose
   run_configurator
